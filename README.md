@@ -42,6 +42,10 @@ caffeinate -i venv/bin/python train.py --data-dir data/fineweb-edu-small --prese
     --batch-size 8 --lr 1e-3 --min-lr 1e-4 --warmup 700 --out checkpoints/small.pt [--resume]
 ```
 
+### Training on a rented GPU
+
+`train.py` picks the device automatically (CUDA, then Apple-Silicon MPS, then CPU). On CUDA it uses bf16 autocast. `--compile` and `--grad-accum` enable large token batches. On CPU nothing changes. [RUNPOD.md](RUNPOD.md) is a step-by-step guide to training `base` for about $10–15.
+
 ### SFT (chat fine-tuning)
 
 1. **Generate grounded Q&A.** `gen_sft_data.py` reads documents back out of `train.bin`, so every question is about text the model saw during pretraining. It asks a larger teacher model behind any OpenAI-compatible endpoint (vLLM, Ollama, LM Studio, OpenRouter and so on) to write question/answer pairs. Pairs that mention "the document" are dropped. Re-running with the same `--out` resumes where it stopped.
@@ -53,6 +57,15 @@ venv/bin/python gen_sft_data.py --base-url http://localhost:11434/v1 --model <te
 venv/bin/python sft.py --init checkpoints/small.pt --data data/fineweb-edu-small/sft_qa.jsonl \
     --hf HuggingFaceTB/everyday-conversations-llama3.1-2k:data/train_sft-00000-of-00001.parquet
 venv/bin/python chat.py --ckpt checkpoints/small-sft.pt
+```
+
+### Benchmark
+
+`benchmark.py` is a small factual test with 14 probes (for example "The capital of France is" → " Paris", scored by answer log-probability and rank) and 12 true-versus-false sentence pairs (won when the true sentence has lower bits/byte). `--log benchmarks.jsonl` appends the results and rebuilds `benchmark_report.html`, a self-contained page with trend charts and per-run detail.
+
+```sh
+venv/bin/python benchmark.py --ckpt checkpoints/mini.pt --log benchmarks.jsonl
+open benchmark_report.html
 ```
 
 ### Export to GGUF (llama.cpp, Ollama, LM Studio)
@@ -68,5 +81,7 @@ llama-cli -m checkpoints/mini-sft-q8_0.gguf                                     
 It was checked against llama.cpp b11203. Tokenization is identical, and greedy generation matches our PyTorch model token for token in f32, for both base and chat checkpoints. q8_0 differs only where the top two tokens are nearly tied.
 
 Presets with their default BPE vocabularies are `tiny` (3.0M params, 2.6M active per token), `mini` (11.0M, 6.3M active; deep-and-thin, tuned for quality), `small` (14.3M, 8.4M active), `medium` (85.9M, 30.8M active) and `base` (283.9M, 130.5M active). You can override any `ModelConfig` field with `--set key=value`.
+
+Each preset from `tiny` to `base` has a `-sparse` twin (`mini-sparse`, `base-sparse` and so on). The twin keeps the same compute per token and has about twice the total parameters: 5× the routed experts at half the width, twice as many active per token, and 8-group routing. It's the fine-grained, high-sparsity recipe behind Qwen3-Next and AliceAI 80B-A3B. For example, `mini-sparse` is 21.4M total with 6.4M active, against `mini`'s 11.0M with 6.3M active. Equal FLOPs doesn't mean equal speed, though: with the current per-expert dispatch, a sparse MoE layer runs about 1.8× slower on CPU.
 
 For reference only (too big for a laptop), there are also `large` (1.31B, 0.32B active), `xl` (5.83B, 1.11B active), `v2-lite` (DeepSeek-V2-Lite's shape: 15.7B, 2.4B active) and `v3` (DeepSeek-V3's exact configuration: 671B, 37B active). `ModelConfig.param_estimate()` computes the exact sizes without building the model, and it reproduces DeepSeek's published figures for V2-Lite and V3.

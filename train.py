@@ -14,6 +14,12 @@ checkpointing every --save-every steps; rerun with --resume to continue):
 
     python train.py --data-dir data/fineweb-edu-small --preset small --out checkpoints/small.pt
     python train.py --data-dir data/fineweb-edu-small --preset small --out checkpoints/small.pt --resume
+
+GPU (e.g. RunPod): device and bf16 are picked automatically; add --compile, and use --grad-accum to
+reach large token batches (tokens/step = batch-size x seq-len x grad-accum):
+
+    python train.py --data-dir data/fineweb-edu-base --preset base --batch-size 16 --seq-len 2048 \
+        --grad-accum 16 --compile --out checkpoints/base.pt
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ import numpy as np
 import torch
 
 from deepseek_moe import DeepSeekMoEModel, ModelConfig
+from deepseek_moe.runtime import autocast, pick_device, resolve_precision, setup_backends
 from deepseek_moe.tokenizer import DEFAULT_BPE_VOCAB, BPETokenizer, ByteTokenizer, encode_files
 
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
@@ -101,8 +108,11 @@ class WindowSampler:
 
 
 def make_batch(data: np.ndarray, starts: list[int], seq_len: int, device: str):
-    chunk = np.stack([data[i : i + seq_len + 1] for i in starts]).astype(np.int64)
-    chunk = torch.from_numpy(chunk).to(device)
+    chunk = torch.from_numpy(np.stack([data[i : i + seq_len + 1] for i in starts]).astype(np.int64))
+    if device.startswith("cuda"):
+        chunk = chunk.pin_memory().to(device, non_blocking=True)  # overlap the copy with compute
+    else:
+        chunk = chunk.to(device)
     return chunk[:, :-1], chunk[:, 1:]
 
 
@@ -119,10 +129,11 @@ def evaluate(model, data, args) -> float:
     model.eval()
     n = args.eval_iters * args.batch_size
     starts = np.linspace(0, len(data) - args.seq_len - 2, n).astype(int).tolist()
-    losses = [
-        model(*make_batch(data, starts[i : i + args.batch_size], args.seq_len, args.device)).metrics["lm_loss"]
-        for i in range(0, n, args.batch_size)
-    ]
+    losses = []
+    for i in range(0, n, args.batch_size):
+        with autocast(args.device, args.precision):
+            out = model(*make_batch(data, starts[i : i + args.batch_size], args.seq_len, args.device))
+        losses.append(out.metrics["lm_loss"])
     model.train()
     return sum(losses) / len(losses)
 
@@ -152,7 +163,8 @@ def main() -> None:
     ap.add_argument("--tokenizer-path", default=None, help="reuse a saved tokenizer.json instead of training")
     ap.add_argument("--out", default="checkpoints/model.pt")
     ap.add_argument("--steps", type=int, default=None, help="default: one pass over --data-dir, else 2000")
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--batch-size", type=int, default=16, help="sequences per micro-batch")
+    ap.add_argument("--grad-accum", type=int, default=1, help="micro-batches per optimizer step")
     ap.add_argument("--seq-len", type=int, default=None, help="default: max_seq_len")
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--min-lr", type=float, default=2e-4)
@@ -164,10 +176,16 @@ def main() -> None:
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--save-every", type=int, default=100)
     ap.add_argument("--resume", action="store_true", help="continue from --out if it exists")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default="auto", help="auto = cuda > mps > cpu")
+    ap.add_argument("--precision", choices=["auto", "fp32", "bf16", "fp16"], default="auto",
+                    help="auto = bf16 autocast on CUDA, fp32 elsewhere")
+    ap.add_argument("--compile", action="store_true", help="torch.compile the model (CUDA; needs torch >= 2.4)")
     ap.add_argument("--seed", type=int, default=1337)
     args = ap.parse_args()
 
+    args.device = pick_device(args.device)
+    args.precision = resolve_precision(args.precision, args.device)
+    setup_backends(args.device)
     torch.manual_seed(args.seed)
     if args.data_dir:
         d = Path(args.data_dir)
@@ -191,9 +209,11 @@ def main() -> None:
     args.seq_len = args.seq_len or cfg.max_seq_len
     sampler = WindowSampler(len(train_data), args.seq_len, args.batch_size, args.seed)
     if args.steps is None:
-        args.steps = sampler.n_windows // args.batch_size if args.data_dir else 2000
-    tokens_per_step = args.batch_size * args.seq_len
-    print(f"{args.steps:,} steps x {tokens_per_step:,} tokens = {args.steps * tokens_per_step / 1e6:.0f}M tokens")
+        args.steps = sampler.n_windows // (args.batch_size * args.grad_accum) if args.data_dir else 2000
+    tokens_per_step = args.batch_size * args.seq_len * args.grad_accum
+    print(f"{args.steps:,} steps x {tokens_per_step:,} tokens = {args.steps * tokens_per_step / 1e6:.0f}M tokens"
+          f"  |  device {args.device}, precision {args.precision}"
+          f"{f', grad-accum {args.grad_accum}' if args.grad_accum > 1 else ''}{', compiled' if args.compile else ''}")
 
     model = DeepSeekMoEModel(cfg).to(args.device)
     counts = model.param_counts()
@@ -215,25 +235,42 @@ def main() -> None:
         start = ckpt["step"] + 1
         print(f"resumed from {args.out} at step {start}")
 
-    t0 = time.time()
+    # Compile a wrapper for the training forward; `model` stays the plain module for saving,
+    # evaluation and MoE bias updates (a compiled module's state_dict keys get prefixed).
+    fwd = torch.compile(model) if args.compile else model
+
+    t0 = t_log = time.time()
+    last_log_step = start
     for step in range(start, args.steps):
         for g in opt.param_groups:
             g["lr"] = lr_at(step, args)
-        out = model(*make_batch(train_data, sampler.starts(step), args.seq_len, args.device))
         opt.zero_grad(set_to_none=True)
-        out.loss.backward()
+        metrics: dict[str, float] = {}
+        total_loss = 0.0
+        for micro in range(args.grad_accum):
+            # Micro-batch index keeps the data order a pure function of (seed, step) for --resume.
+            batch = make_batch(train_data, sampler.starts(step * args.grad_accum + micro), args.seq_len, args.device)
+            with autocast(args.device, args.precision):
+                out = fwd(*batch)
+            (out.loss / args.grad_accum).backward()
+            total_loss += out.loss.item() / args.grad_accum
+            for k, v in out.metrics.items():
+                metrics[k] = metrics.get(k, 0.0) + v / args.grad_accum
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
         balance = model.update_moe_biases()  # aux-loss-free load balancing
 
         if step % args.log_every == 0 or step == args.steps - 1:
-            m = {**out.metrics, **balance}
+            now = time.time()
+            m = {**metrics, **balance}
             parts = "  ".join(f"{k} {v:.4f}" for k, v in m.items())
-            elapsed = time.time() - t0
+            elapsed = now - t0
             eta = elapsed / (step - start + 1) * (args.steps - step - 1)
-            print(f"step {step:6d}/{args.steps}  loss {out.loss.item():.4f}  {parts}  lr {lr_at(step, args):.2e}  "
-                  f"{(step + 1) * tokens_per_step / 1e6:.1f}M tok  {elapsed / 3600:.2f}h  eta {eta / 3600:.1f}h",
-                  flush=True)
+            tok_s = (step - last_log_step) * tokens_per_step / max(now - t_log, 1e-9) if step > last_log_step else 0.0
+            t_log, last_log_step = now, step
+            print(f"step {step:6d}/{args.steps}  loss {total_loss:.4f}  {parts}  lr {lr_at(step, args):.2e}  "
+                  f"{(step + 1) * tokens_per_step / 1e6:.1f}M tok  {tok_s:,.0f} tok/s  "
+                  f"{elapsed / 3600:.2f}h  eta {eta / 3600:.1f}h", flush=True)
         if (step > 0 and step % args.eval_every == 0) or step == args.steps - 1:
             print(f"  val lm_loss {evaluate(model, val_data, args):.4f}", flush=True)
         if (step > 0 and step % args.save_every == 0) or step == args.steps - 1:

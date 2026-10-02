@@ -2,17 +2,20 @@
 name = "deepseek-moe-style"
 version = "0.1.0"
 description = "A small, configurable DeepSeek-V3-style MoE language model (MLA + DeepSeekMoE + MTP + FP8 sim)"
-# torch 2.2.2 is the last release with macOS x86_64 wheels, and it supports Python <= 3.12
+# Intel Macs are stuck on torch 2.2.2 (the last macOS x86_64 build), which supports Python <= 3.12.
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "torch==2.2.2",
-    "numpy<2",
+    # Intel Mac: last available build. Everywhere else (Linux/CUDA on RunPod, Apple Silicon): current torch.
+    "torch==2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "torch>=2.6; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "numpy<2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "numpy; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "tokenizers>=0.23.2",
     "datasets>=5.0.1",
     "openai>=3.19.2",
-    "transformers>=5.17.0",
-    "safetensors>=0.8.0",
     "gguf>=0.19.0",
+    "safetensors>=0.8.0",
+    "huggingface-hub>=1.33.0",
 ]
 
 [dependency-groups]

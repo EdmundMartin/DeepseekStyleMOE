@@ -132,7 +132,9 @@ def add_tokenizer(w: gguf.GGUFWriter, tok: BPETokenizer, vocab_size: int, chat: 
     eot = vocab[EOT]
     # Documents were EOT-separated in pretraining, so EOT doubles as beginning-of-document.
     w.add_bos_token_id(eot)
-    w.add_add_bos_token(True)
+    # Base models were trained on EOT-separated documents, so EOT doubles as BOS; SFT conversations
+    # were trained without it, so chat models don't prepend it.
+    w.add_add_bos_token(not chat)
     if chat:
         end = vocab[END]
         w.add_eos_token_id(end)

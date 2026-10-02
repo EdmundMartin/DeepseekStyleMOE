@@ -20,6 +20,8 @@ EOT = "<|endoftext|>"
 # params, so small models need small vocabularies.
 DEFAULT_BPE_VOCAB = {"tiny": 8192, "mini": 8192, "small": 8192, "medium": 8192, "base": 32768,
                      "large": 32768, "xl": 65536, "v2-lite": 102400, "v3": 129280}
+# Sparse twins use their dense twin's vocab.
+DEFAULT_BPE_VOCAB.update({f"{k}-sparse": DEFAULT_BPE_VOCAB[k] for k in ("tiny", "mini", "small", "medium", "base")})
 
 
 class BPETokenizer:
@@ -29,13 +31,13 @@ class BPETokenizer:
         self.tok = tok
 
     @staticmethod
-    def _new(vocab_size: int) -> tuple[Tokenizer, trainers.BpeTrainer]:
+    def _new(vocab_size: int, extra_special: Iterable[str] = ()) -> tuple[Tokenizer, trainers.BpeTrainer]:
         tok = Tokenizer(models.BPE())
         tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
         tok.decoder = decoders.ByteLevel()
         trainer = trainers.BpeTrainer(
             vocab_size=vocab_size,
-            special_tokens=[EOT],
+            special_tokens=[EOT, *extra_special],
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
             show_progress=True,
         )
@@ -48,8 +50,8 @@ class BPETokenizer:
         return cls(tok)
 
     @classmethod
-    def train_from_texts(cls, texts: Iterable[str], vocab_size: int) -> "BPETokenizer":
-        tok, trainer = cls._new(vocab_size)
+    def train_from_texts(cls, texts: Iterable[str], vocab_size: int, extra_special: Iterable[str] = ()) -> "BPETokenizer":
+        tok, trainer = cls._new(vocab_size, extra_special)
         tok.train_from_iterator(texts, trainer)
         return cls(tok)
 

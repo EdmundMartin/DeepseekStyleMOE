@@ -14,19 +14,23 @@ import torch
 
 from deepseek_moe import DeepSeekMoEModel, ModelConfig
 from deepseek_moe.chat import END, render_prompt
+from deepseek_moe.runtime import pick_device
 from deepseek_moe.tokenizer import load_tokenizer
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="checkpoints/small-sft.pt")
+    ap.add_argument("--ckpt", default="checkpoints/mini-sft.pt")
     ap.add_argument("--system", default=None)
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--top-k", type=int, default=40)
+    ap.add_argument("--top-p", type=float, default=0.9, help="nucleus sampling; 1.0 disables")
+    ap.add_argument("--rep-penalty", type=float, default=1.1, help="repetition penalty; 1.0 disables")
     ap.add_argument("--max-new-tokens", type=int, default=300)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default="auto", help="auto = cuda > apple-silicon mps > cpu")
     args = ap.parse_args()
 
+    args.device = pick_device(args.device)
     ckpt = torch.load(args.ckpt, map_location=args.device)
     if not ckpt.get("chat"):
         raise SystemExit(f"{args.ckpt} is not an SFT checkpoint; run sft.py first")
@@ -56,7 +60,8 @@ def main() -> None:
         prompt = prompt[-(model.cfg.max_seq_len - args.max_new_tokens):]
         ids = torch.tensor([prompt], device=args.device)
         out = model.generate(ids, args.max_new_tokens, temperature=args.temperature,
-                             top_k=args.top_k, stop_ids={end_id})
+                             top_k=args.top_k, top_p=args.top_p,
+                             repetition_penalty=args.rep_penalty, stop_ids={end_id})
         reply_ids = [t for t in out[0, ids.shape[1]:].tolist() if t != end_id]
         reply = tok.decode(reply_ids).strip()
         print(f"bot> {reply}")

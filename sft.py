@@ -26,6 +26,7 @@ import torch
 
 from deepseek_moe import DeepSeekMoEModel, ModelConfig
 from deepseek_moe.chat import END, IGNORE, add_chat_tokens, encode_conversation, render_prompt
+from deepseek_moe.runtime import autocast, pick_device, resolve_precision, setup_backends
 from deepseek_moe.tokenizer import load_tokenizer
 
 
@@ -45,15 +46,20 @@ def load_conversations(jsonl: list[str], hf: list[str]) -> list[list[dict]]:
 
 
 def make_batch(examples: list[tuple[list[int], list[int]]], pad_id: int, device: str):
-    """Right-pad to the longest example; padding is never trained on."""
+    """Right-pad to the longest example; padding is never trained on.
+
+    Returns (inputs, targets, token_mask); token_mask marks real (non-padding) input positions.
+    """
     T = max(len(ids) for ids, _ in examples)
     ids = torch.full((len(examples), T), pad_id, dtype=torch.long)
     labels = torch.full((len(examples), T), IGNORE, dtype=torch.long)
+    mask = torch.zeros((len(examples), T), dtype=torch.bool)
     for i, (x, y) in enumerate(examples):
         ids[i, : len(x)] = torch.tensor(x)
         labels[i, : len(y)] = torch.tensor(y)
+        mask[i, : len(x)] = True
     # Position t predicts token t+1.
-    return ids[:, :-1].to(device), labels[:, 1:].to(device)
+    return ids[:, :-1].to(device), labels[:, 1:].to(device), mask[:, :-1].to(device)
 
 
 @torch.no_grad()
@@ -61,7 +67,9 @@ def evaluate(model, val, args) -> float:
     model.eval()
     losses = []
     for i in range(0, len(val), args.batch_size):
-        out = model(*make_batch(val[i : i + args.batch_size], args.pad_id, args.device))
+        with autocast(args.device, args.precision):
+            x, y, mask = make_batch(val[i : i + args.batch_size], args.pad_id, args.device)
+            out = model(x, y, token_mask=mask)
         losses.append(out.metrics["lm_loss"])
     model.train()
     return sum(losses) / max(1, len(losses))
@@ -91,13 +99,21 @@ def main() -> None:
     ap.add_argument("--val-frac", type=float, default=0.05)
     ap.add_argument("--eval-every", type=int, default=200)
     ap.add_argument("--log-every", type=int, default=20)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default="auto", help="auto = cuda > apple-silicon mps > cpu")
+    ap.add_argument("--precision", choices=["auto", "fp32", "bf16", "fp16"], default="auto",
+                    help="auto = bf16 autocast on CUDA, fp32 elsewhere")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--update-moe-bias", action="store_true",
+                    help="keep running aux-loss-free bias updates during SFT (default: frozen at the pretrained "
+                         "values, so a small fine-tune can't skew routing that was balanced over pretraining)")
     args = ap.parse_args()
     if not args.data and not args.hf:
         ap.error("give at least one --data or --hf source")
 
     torch.manual_seed(args.seed)
+    args.device = pick_device(args.device)
+    args.precision = resolve_precision(args.precision, args.device)
+    setup_backends(args.device)
     ckpt = torch.load(args.init, map_location=args.device)
     tok = load_tokenizer(**ckpt["tokenizer"])
     if tok.kind != "bpe":
@@ -139,12 +155,14 @@ def main() -> None:
         batch = [train[order.pop()] for _ in range(min(args.batch_size, len(order)))]
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
-        out = model(*make_batch(batch, args.pad_id, args.device))
+        with autocast(args.device, args.precision):
+            x, y, mask = make_batch(batch, args.pad_id, args.device)
+            out = model(x, y, token_mask=mask)
         opt.zero_grad(set_to_none=True)
         out.loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
-        balance = model.update_moe_biases()
+        balance = model.update_moe_biases(update=args.update_moe_bias)  # frozen by default; stats only
 
         if step % args.log_every == 0 or step == total - 1:
             m = "  ".join(f"{k} {v:.4f}" for k, v in {**out.metrics, **balance}.items())

@@ -182,3 +182,29 @@ PRESETS: dict[str, dict] = {
         max_seq_len=4096, init_std=0.006, use_fp8=True,
     ),
 }
+
+
+# ---- Sparse twins: same compute per token, about 2x the total parameters ----
+# Built from each dense preset with one rule, following fine-grained MoE practice
+# (DeepSeekMoE, Qwen3-Next / AliceAI 80B-A3B): 5x more routed experts at half the width,
+# 2x as many active per token (so active expert FLOPs match), 2x shared experts at half
+# width (so the always-on path keeps its size), and V3-style 8-group routing.
+# Sizes with the default BPE vocab (total / activated):
+#   tiny-sparse   3.6M /   2.6M     mini-sparse   21.4M /   6.4M    small-sparse  26.2M / 8.5M
+#   medium-sparse 185.3M / 31.2M    base-sparse  568.0M / 131.5M
+# Note: equal FLOPs is not equal speed. Many small experts cost ~1.8x per MoE layer on CPU
+# with the per-expert loop; a grouped-GEMM expert kernel is needed to close that gap on GPU.
+SPARSE_OVERRIDES: dict[str, dict] = {
+    "tiny":   dict(n_routed_experts=32,  moe_hidden_dim=32,  n_activated_experts=4,  n_shared_experts=2,
+                   n_expert_groups=4, n_limited_groups=2),
+    "mini":   dict(n_routed_experts=64,  moe_hidden_dim=64,  n_activated_experts=6,  n_shared_experts=2,
+                   n_expert_groups=8, n_limited_groups=4),
+    "small":  dict(n_routed_experts=80,  moe_hidden_dim=64,  n_activated_experts=8,  n_shared_experts=2,
+                   n_expert_groups=8, n_limited_groups=4),
+    "medium": dict(n_routed_experts=120, moe_hidden_dim=128, n_activated_experts=8,  n_shared_experts=2,
+                   n_expert_groups=8, n_limited_groups=4),
+    "base":   dict(n_routed_experts=160, moe_hidden_dim=128, n_activated_experts=12, n_shared_experts=4,
+                   n_expert_groups=8, n_limited_groups=4),
+}
+for _name, _over in SPARSE_OVERRIDES.items():
+    PRESETS[f"{_name}-sparse"] = {**PRESETS[_name], **_over}

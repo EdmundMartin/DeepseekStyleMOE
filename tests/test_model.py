@@ -112,3 +112,79 @@ def test_param_estimate_matches_model_and_deepseek_papers():
     assert round(v3["total"] / 1e9) == 671 and round(v3["activated"] / 1e9) == 38  # paper: 671B / 37B
     lite = ModelConfig.from_preset("v2-lite").param_estimate()
     assert round(lite["total"] / 1e9, 1) == 15.7
+
+
+def test_sample_next_top_p_and_repetition_penalty():
+    from deepseek_moe.model import sample_next
+
+    logits = torch.tensor([[4.0, 3.0, 1.0, -2.0]])
+    ctx = torch.tensor([[0]])
+    # Greedy picks 0; a strong repetition penalty on token 0 flips it to 1.
+    assert sample_next(logits, ctx, temperature=0).item() == 0
+    assert sample_next(logits, ctx, temperature=0, repetition_penalty=2.0).item() == 1
+    # Negative logits are pushed further down, never up.
+    assert sample_next(torch.tensor([[-1.0, -1.5]]), torch.tensor([[0]]), temperature=0, repetition_penalty=2.0).item() == 1
+    # Tiny top_p keeps only the most likely token, so sampling becomes deterministic.
+    torch.manual_seed(0)
+    assert all(sample_next(logits, ctx, temperature=1.0, top_p=0.01).item() == 0 for _ in range(50))
+    # top_p=0.9 here keeps tokens 0 and 1 (p ~0.71, ~0.26) and drops the tail.
+    picks = {sample_next(logits, ctx, temperature=1.0, top_p=0.9).item() for _ in range(300)}
+    assert picks == {0, 1}
+
+
+def test_generate_with_sampling_options():
+    torch.manual_seed(0)
+    model = DeepSeekMoEModel(tiny(max_seq_len=32))
+    out = model.generate(torch.zeros(1, 4, dtype=torch.long), 20, temperature=0.7, top_k=20,
+                         top_p=0.9, repetition_penalty=1.2)
+    assert out.shape == (1, 24)
+
+
+def test_sparse_twins_keep_compute_and_add_capacity():
+    from deepseek_moe.config import PRESETS
+    from deepseek_moe.tokenizer import DEFAULT_BPE_VOCAB
+
+    for name in ["tiny", "mini", "small", "medium", "base"]:
+        v = DEFAULT_BPE_VOCAB[f"{name}-sparse"]
+        dense = ModelConfig.from_preset(name, vocab_size=v).param_estimate()
+        sparse = ModelConfig.from_preset(f"{name}-sparse", vocab_size=v).param_estimate()
+        assert abs(sparse["activated"] / dense["activated"] - 1) < 0.03, name   # same compute per token
+        assert sparse["total"] > 1.15 * dense["total"], name                     # more capacity
+        assert PRESETS[f"{name}-sparse"]["dim"] == PRESETS[name]["dim"]          # only the experts change
+    # The sparse twin actually builds and runs.
+    m = DeepSeekMoEModel(ModelConfig.from_preset("mini-sparse", vocab_size=512, n_layers=2, max_seq_len=32))
+    x = torch.randint(0, 512, (2, 17))
+    assert torch.isfinite(m(x[:, :-1], x[:, 1:]).loss)
+
+
+def test_padding_mask_excludes_pads_from_moe_load_and_aux():
+    torch.manual_seed(0)
+    model = DeepSeekMoEModel(tiny(vocab_size=256, max_seq_len=32)).train()
+    x = torch.randint(1, 256, (2, 17))
+    # Unmasked vs all-true mask: identical aux loss and load (pretraining behaviour unchanged).
+    out_a = model(x[:, :-1], x[:, 1:])
+    load_a = [m.expert_load.clone() for m in model.moe_layers()]
+    model.update_moe_biases(update=False)
+    out_b = model(x[:, :-1], x[:, 1:], token_mask=torch.ones(2, 16, dtype=torch.bool))
+    load_b = [m.expert_load.clone() for m in model.moe_layers()]
+    model.update_moe_biases(update=False)
+    assert torch.isclose(out_a.loss, out_b.loss)
+    assert all(torch.equal(a, b) for a, b in zip(load_a, load_b))
+    # Masking the second half of each sequence removes those tokens from the counts.
+    mask = torch.zeros(2, 16, dtype=torch.bool)
+    mask[:, :8] = True
+    model(x[:, :-1], x[:, 1:], token_mask=mask)
+    k = model.cfg.n_activated_experts
+    assert all(m.ffn.expert_load.sum().item() == 2 * 8 * k for m in model.layers if hasattr(m.ffn, "expert_load"))
+    assert all(m.token_mask is None for m in model.moe_layers())  # mask is cleared after the forward
+
+
+def test_frozen_bias_updates_report_but_do_not_change_biases():
+    model = DeepSeekMoEModel(tiny(vocab_size=256, max_seq_len=32)).train()
+    x = torch.randint(0, 256, (2, 17))
+    model(x[:, :-1], x[:, 1:])
+    before = [m.gate.bias.clone() for m in model.moe_layers()]
+    stats = model.update_moe_biases(update=False)
+    assert "max_load_ratio" in stats
+    assert all(torch.equal(a, m.gate.bias) for a, m in zip(before, model.moe_layers()))
+    assert all(m.expert_load.sum() == 0 for m in model.moe_layers())

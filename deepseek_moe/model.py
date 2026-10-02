@@ -14,6 +14,43 @@ from .mla import MLA, RMSNorm, precompute_rope
 from .moe import Gate, MoE, SwiGLU
 
 
+def sample_next(
+    logits: torch.Tensor,
+    context: torch.Tensor,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    repetition_penalty: float = 1.0,
+) -> torch.Tensor:
+    """Pick the next token from last-position logits [B, V]; returns [B, 1].
+
+    Order: repetition penalty -> temperature -> top-k -> top-p (nucleus) -> sample.
+    temperature <= 0 means greedy (after the repetition penalty).
+    """
+    logits = logits.float()
+    if repetition_penalty != 1.0:
+        # CTRL-style penalty on every token already in the context: shrink positive
+        # logits and push negative ones further down, so repeats get less likely.
+        prev = logits.gather(1, context)
+        prev = torch.where(prev > 0, prev / repetition_penalty, prev * repetition_penalty)
+        logits = logits.scatter(1, context, prev)
+    if temperature <= 0:
+        return logits.argmax(-1, keepdim=True)
+    logits = logits / temperature
+    if top_k is not None:
+        v, _ = logits.topk(min(top_k, logits.shape[-1]))
+        logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
+    if top_p is not None and top_p < 1.0:
+        sorted_logits, order = logits.sort(dim=-1, descending=True)
+        probs = sorted_logits.softmax(-1)
+        # Drop tokens once the probability mass *before* them already exceeds top_p
+        # (so the single most likely token is always kept).
+        drop = probs.cumsum(-1) - probs > top_p
+        sorted_logits = sorted_logits.masked_fill(drop, float("-inf"))
+        logits = torch.full_like(logits, float("-inf")).scatter(1, order, sorted_logits)
+    return torch.multinomial(logits.softmax(-1), 1)
+
+
 def masked_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     """Cross-entropy ignoring targets of -100 (SFT prompt tokens / padding).
 
@@ -90,8 +127,22 @@ class DeepSeekMoEModel(nn.Module):
 
     # ------------------------------------------------------------------ forward
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None) -> ModelOutput:
-        """Training / evaluation forward. idx, targets: [B, T] (targets = idx shifted by 1)."""
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
+                token_mask: torch.Tensor | None = None) -> ModelOutput:
+        """Training / evaluation forward. idx, targets: [B, T] (targets = idx shifted by 1).
+
+        token_mask: optional [B, T] bool of real (non-padding) positions; padding is excluded
+        from MoE load statistics and the balance loss (SFT batches are right-padded).
+        """
+        for m in self.moe_layers():
+            m.token_mask = token_mask
+        try:
+            return self._forward(idx, targets)
+        finally:
+            for m in self.moe_layers():
+                m.token_mask = None
+
+    def _forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None) -> ModelOutput:
         B, T = idx.shape
         assert T <= self.cfg.max_seq_len, f"sequence length {T} > max_seq_len {self.cfg.max_seq_len}"
         cos, sin = self.rope_cos[:T], self.rope_sin[:T]
@@ -148,6 +199,8 @@ class DeepSeekMoEModel(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
         stop_ids: set[int] | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float = 1.0,
     ) -> torch.Tensor:
         """Sample using the MLA latent KV cache (the cache holds only c_KV and k_pe)."""
         self.eval()
@@ -164,11 +217,7 @@ class DeepSeekMoEModel(nn.Module):
             else:
                 logits = self.forward_cached(idx[:, -1:], caches, pos)
                 pos += 1
-            logits = logits.float() / max(temperature, 1e-6)
-            if top_k is not None:
-                v, _ = logits.topk(min(top_k, logits.shape[-1]))
-                logits[logits < v[:, [-1]]] = float("-inf")
-            nxt = torch.multinomial(logits.softmax(-1), 1) if temperature > 0 else logits.argmax(-1, keepdim=True)
+            nxt = sample_next(logits, idx, temperature, top_k, top_p, repetition_penalty)
             idx = torch.cat([idx, nxt], dim=1)
             if stop_ids and idx.shape[0] == 1 and nxt.item() in stop_ids:
                 break
@@ -199,11 +248,14 @@ class DeepSeekMoEModel(nn.Module):
         return [m for m in self.modules() if isinstance(m, MoE)]
 
     @torch.no_grad()
-    def update_moe_biases(self) -> dict[str, float]:
-        """Aux-loss-free balancing step; call once after each optimizer step."""
+    def update_moe_biases(self, update: bool = True) -> dict[str, float]:
+        """Aux-loss-free balancing step; call once after each optimizer step.
+
+        update=False only reports (and resets) the load stats, leaving the biases frozen.
+        """
         imbalance = []
         for m in self.moe_layers():
-            load = m.update_bias()
+            load = m.update_bias(update)
             if load.sum() > 0:
                 imbalance.append((load.max() / load.mean()).item())
         if not imbalance:

@@ -8,7 +8,8 @@ Interactive commands:
     <text>          continue the text (write \\n for a newline)
     /top <text>     top next-token predictions after <text>
     /ppl <text>     loss, perplexity and bits/byte of <text>
-    /set k=v ...    change temperature, top_k, tokens, e.g. /set temperature=0.3 tokens=100
+    /set k=v ...    change temperature, top_k, top_p, rep_penalty, tokens,
+                    e.g. /set temperature=0.3 rep_penalty=1.2 tokens=100
     /info           checkpoint details
     /quit
 """
@@ -21,11 +22,13 @@ import math
 import torch
 
 from deepseek_moe import DeepSeekMoEModel, ModelConfig
+from deepseek_moe.runtime import pick_device
 from deepseek_moe.tokenizer import ByteTokenizer, load_tokenizer
 
 
 class Tester:
     def __init__(self, args):
+        args.device = pick_device(args.device)
         self.args = args
         self.ckpt = torch.load(args.ckpt, map_location=args.device)
         # Older checkpoints predate BPE and were trained on raw bytes.
@@ -36,7 +39,8 @@ class Tester:
         self.model.eval()
         if args.fp8:
             self.model.freeze_fp8()
-        self.settings = {"temperature": args.temperature, "top_k": args.top_k, "tokens": args.tokens}
+        self.settings = {"temperature": args.temperature, "top_k": args.top_k, "top_p": args.top_p,
+                         "rep_penalty": args.rep_penalty, "tokens": args.tokens}
 
     def encode(self, text: str) -> list[int]:
         # Documents were separated by EOT in pretraining, so a leading EOT means "start of a document".
@@ -57,7 +61,8 @@ class Tester:
         ids = torch.tensor([self.encode(text)], device=self.args.device)
         s = self.settings
         out = self.model.generate(ids, int(s["tokens"]), temperature=float(s["temperature"]),
-                                  top_k=int(s["top_k"]) if s["top_k"] else None)
+                                  top_k=int(s["top_k"]) if s["top_k"] else None,
+                                  top_p=float(s["top_p"]), repetition_penalty=float(s["rep_penalty"]))
         return text + self.tok.decode(out[0, ids.shape[1]:].tolist())
 
     @torch.no_grad()
@@ -104,8 +109,10 @@ def main() -> None:
     ap.add_argument("--tokens", type=int, default=200)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-k", type=int, default=50)
+    ap.add_argument("--top-p", type=float, default=0.9, help="nucleus sampling; 1.0 disables")
+    ap.add_argument("--rep-penalty", type=float, default=1.1, help="repetition penalty; 1.0 disables")
     ap.add_argument("--fp8", action="store_true", help="freeze FP8 layers to float8 storage (needs use_fp8 model)")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default="auto", help="auto = cuda > apple-silicon mps > cpu")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 

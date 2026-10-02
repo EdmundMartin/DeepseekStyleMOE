@@ -4,3 +4,5 @@ __pycache__/
 data/
 checkpoints/
 token
+benchmark_report.html
+release/
