@@ -43,7 +43,15 @@ CODE_LANGUAGES = {"Python", "JavaScript", "TypeScript", "Java", "C", "C++", "C#"
 MAX_CODE_BYTES = 50_000  # skip minified / generated monsters
 
 
+# "tokens": render with the chat special tokens (they're added to a freshly trained tokenizer);
+# "plain": readable "User: / Assistant:" text, for tokenizers without chat tokens.
+CHAT_RENDER = "tokens"
+
+
 def _render_chat(messages: list[dict]) -> str:
+    if CHAT_RENDER == "plain":
+        names = {"system": "System", "user": "User", "assistant": "Assistant"}
+        return "\n\n".join(f"{names[m['role']]}: {m['content']}" for m in messages if m["role"] in names)
     return "".join(f"{ROLE_TOKENS[m['role']]}{m['content']}{END}" for m in messages if m["role"] in ROLE_TOKENS)
 
 
@@ -63,6 +71,13 @@ SOURCES: dict[str, tuple[str, str, list[str], Callable]] = {
     "cosmopedia": ("HuggingFaceTB/cosmopedia", "data/", ["text"],
                    lambda b: iter(b.column("text").to_pylist())),
     "code": ("codeparrot/github-code-clean", "data/", ["code", "language", "license", "size"], _code_rows),
+    "finemath": ("HuggingFaceTB/finemath", "finemath-4plus/", ["text"],
+                 lambda b: iter(b.column("text").to_pylist())),
+    # Cosmopedia's educational subsets, separately so a mix can weight them (and not just read
+    # the alphabetically-first auto_math_text shards).
+    **{f"cosmo-{sub}": ("HuggingFaceTB/cosmopedia", f"data/{sub}/", ["text"],
+                        lambda b: iter(b.column("text").to_pylist()))
+       for sub in ("stanford", "openstax", "wikihow", "khanacademy")},
     "smoltalk": ("HuggingFaceTB/smoltalk", "data/all/train-", ["messages"],
                  lambda b: (_render_chat(m) for m in b.column("messages").to_pylist())),
 }
@@ -115,6 +130,9 @@ def main() -> None:
     ap.add_argument("--tokenizer-path", default=None, help="reuse this tokenizer.json instead of training one")
     ap.add_argument("--skip-docs", nargs="*", default=[], metavar="SOURCE=N",
                     help="skip the first N documents of a source (e.g. ones an earlier dataset already used)")
+    ap.add_argument("--val-from", default=None, metavar="DIR",
+                    help="copy val.bin from another dataset (same tokenizer) instead of building one, "
+                         "so validation losses stay comparable across models")
     ap.add_argument("--extend", default=None, metavar="DIR",
                     help="grow an existing dataset: reuse its tokenizer and val.bin, skip the documents it used "
                          "(single-source fineweb-edu), and write its train.bin + the new tokens to --out-dir. "
@@ -137,6 +155,8 @@ def main() -> None:
         args.val_tokens = 0  # keep the original validation set so losses stay comparable
         if list(mix) == ["fineweb-edu"] and "fineweb-edu" not in skips:
             skips["fineweb-edu"] = base_meta["documents"]
+    if args.val_from:
+        args.val_tokens = 0
     chat_in_mix = "smoltalk" in mix
     vocab = args.vocab_size or DEFAULT_BPE_VOCAB.get(args.preset, 8192)
     total_params = ModelConfig.from_preset(args.preset, vocab_size=vocab).param_estimate()["total"]
@@ -159,6 +179,11 @@ def main() -> None:
         print(f"reusing tokenizer {args.tokenizer_path} (vocab {tok.vocab_size})")
         tok.save(out / "tokenizer.json")
         mix_sample = False
+        if chat_in_mix and tok.token_to_id(CHAT_TOKENS[1]) is None:
+            global CHAT_RENDER
+            CHAT_RENDER = "plain"
+            chat_in_mix = False
+            print("tokenizer has no chat tokens: conversations are rendered as plain 'User: / Assistant:' text")
     else:
         mix_sample = True
 
@@ -230,6 +255,11 @@ def main() -> None:
         for f in files.values():
             f.close()
 
+    if args.val_from:
+        import shutil
+        shutil.copyfile(Path(args.val_from) / "val.bin", out / "val.bin")
+        written["val"] = (out / "val.bin").stat().st_size // 2
+        print(f"validation set copied from {args.val_from} ({written['val']:,} tokens)")
     total = written["train"] + written["val"]
     meta = {
         "preset": args.preset, "vocab_size": tok.vocab_size, "params_total": total_params,
